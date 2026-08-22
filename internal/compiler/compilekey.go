@@ -95,6 +95,12 @@ type KeyContext struct {
 // (package-default registry). cfg must be the compile-time resolved config
 // (per-run overrides already applied by the caller).
 func NewKeyContext(cfg *config.Config, pr *prompts.Registry) (*KeyContext, error) {
+	return NewKeyContextForMode(cfg, pr, false)
+}
+
+// NewKeyContextForMode computes key material for config-backed or injected
+// completion mode. injected only changes Tier-3 completion inputs.
+func NewKeyContextForMode(cfg *config.Config, pr *prompts.Registry, injected bool) (*KeyContext, error) {
 	if pr == nil {
 		pr = prompts.DefaultRegistry()
 	}
@@ -102,7 +108,7 @@ func NewKeyContext(cfg *config.Config, pr *prompts.Registry) (*KeyContext, error
 	if err != nil {
 		return nil, fmt.Errorf("compile key: templates: %w", err)
 	}
-	full, err := canonicalSubsetJSON(compileConfigSubset(cfg))
+	full, err := canonicalSubsetJSON(compileConfigSubsetForMode(cfg, injected))
 	if err != nil {
 		return nil, fmt.Errorf("compile key: config subset: %w", err)
 	}
@@ -144,7 +150,13 @@ func (kc *KeyContext) Parts(sourceHash string, tier int) CompileKeyParts {
 // review): key material must never embed error text. Callers handling many
 // docs should prefer NewKeyContext + Parts (one computation per run).
 func ComputeCompileKeyParts(sourceHash string, tier int, cfg *config.Config, pr *prompts.Registry) (CompileKeyParts, error) {
-	kc, err := NewKeyContext(cfg, pr)
+	return ComputeCompileKeyPartsForMode(sourceHash, tier, cfg, pr, false)
+}
+
+// ComputeCompileKeyPartsForMode is ComputeCompileKeyParts with an explicit
+// completion mode for engine embedders.
+func ComputeCompileKeyPartsForMode(sourceHash string, tier int, cfg *config.Config, pr *prompts.Registry, injected bool) (CompileKeyParts, error) {
+	kc, err := NewKeyContextForMode(cfg, pr, injected)
 	if err != nil {
 		return CompileKeyParts{}, err
 	}
@@ -273,6 +285,7 @@ func compileConfigSubset(cfg *config.Config) map[string]any {
 	put("compiler.dedup_threshold", floatOrDefault(c.DedupThreshold, 0.85)) // dedup.go:37
 	put("compiler.dedup_strategy", strOrDefault(c.DedupStrategy, "embedding"))
 	put("compiler.split_threshold", intOrDefault(c.SplitThreshold, 15000)) // write.go:60
+	put("compiler.max_source_context_tokens", c.MaxSourceContextTokensOrDefault())
 	put("compiler.split_strategy", strOrDefault(c.SplitStrategy, "headings"))
 	put("compiler.min_concept_sources", c.MinConceptSourcesOrDefault())
 	put("compiler.strip_broken_links", c.StripBrokenLinks)
@@ -347,6 +360,24 @@ func compileConfigSubset(cfg *config.Config) map[string]any {
 	put("vectors.quantization", strOrDefault(cfg.Vectors.Quantization, "none"))
 
 	return s
+}
+
+func compileConfigSubsetForMode(cfg *config.Config, injected bool) map[string]any {
+	subset := compileConfigSubset(cfg)
+	if !injected {
+		return subset
+	}
+	for _, key := range []string{
+		"api.provider",
+		"api.extra_params",
+		"compiler.temperature",
+		"compiler.mode",
+		"compiler.prompt_cache",
+	} {
+		delete(subset, key)
+	}
+	subset["completion.mode"] = "injected"
+	return subset
 }
 
 // chunkConfigSubset is the tier < 3 key's config component (spec R6):
@@ -459,6 +490,7 @@ var subsetPolicy = map[string]string{
 	"compiler.tier_defaults":                       "",
 	"compiler.timezone":                            "",
 	"compiler.max_parallel":                        "runtime scheduling; D3 makes output order-independent",
+	"compiler.max_source_context_tokens":           "",
 	"compiler.debounce_seconds":                    "watch-mode runtime knob",
 	"compiler.auto_commit":                         "git side effect, not artifact content",
 	"compiler.auto_lint":                           "lint trigger, not compile output",

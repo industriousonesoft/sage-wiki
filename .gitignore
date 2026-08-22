@@ -16,6 +16,10 @@ sage/
 
 # Build
 /sage-wiki
+/civalidate
+/ciobserve
+/ciproof
+/testsummary
 bin/
 
 # memory-benchmark working data (datasets, projects, checkpoints)

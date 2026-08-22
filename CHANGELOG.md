@@ -2,7 +2,22 @@
 
 ## [Unreleased]
 
+## 0.2.9 — 2026-08-14
+
 ### Fixed
+
+- **Go 1.26.6 security toolchain.** `go.mod` now pins Go 1.26.6 for builds,
+  addressing GO-2026-6218 (CVE-2026-56860, quadratic-time URL path
+  resolution) and GO-2026-6090 (CVE-2026-56862, TLS KeyUpdate denial of
+  service).
+
+- **Bounded source context for high-fanout concepts (#146).** `buildSourceContext`
+  now caps the total assembled source context to a configurable token budget
+  (default 100,000 tokens). Sources are prioritized by match density so
+  high-relevance sources are kept when budget pressure forces truncation. A
+  visible warning is logged with concept name, sources kept/dropped, and budget.
+  Previously, a concept cited across many documents could silently exceed the
+  model's context window, producing a 400 error and no article.
 
 - **Deterministic document-budget timeout attribution.** Summarization and
   triple extraction now identify `compile_doc_timeout` from the exact child
@@ -35,6 +50,36 @@
 
 ### Added
 
+- **Opt-in in-memory compile providers for Go embedders.** `pkg/engine` now
+  exposes `WithCompileProvider`, allowing `Workspace.Compile` completions to
+  use a caller-owned `pkg/provider.Provider` without storing its credential in
+  `config.yaml`. Existing `WithProvider` behavior remains search-only, and
+  callers that do not opt in remain config-backed. Injected completion errors
+  fail closed without config fallback; usage accounting, compile-key mode
+  separation, structured-output validation, and synchronous-mode enforcement
+  remain active.
+
+- **CI responsibility foundation (advisory).** Quality responsibility is now
+  machine-readable: `ci/standards.yaml` records every standard with owner,
+  witness, purpose/authority evidence, diagnostics, and qualification state;
+  `ci/package-ownership.yaml` partitions all Go packages exactly once;
+  `ci/platform-contracts.yaml` inventories platform-sensitive source against
+  focused Windows/macOS contracts. A fail-closed validator
+  (`tools/civalidate`) checks these manifests against the live tree — exact
+  package partition, aggregate membership, Make targets, determinism roles,
+  and platform-signal ownership — and a Go-test JSON summarizer
+  (`tools/testsummary`) produces actionable annotations while preserving the
+  source command's exit status. `make ci` is redefined as the accurate local
+  fast gate (formatting, module verification, builds, vet, new-issue lint,
+  responsibility validation, determinism, generated/API/skill drift,
+  translation checks, non-race tests) and prints the hosted-only evidence it
+  does not cover; `make ci-race` is the canonical local race contract. A new
+  advisory CI job runs the checker self-tests and live validation: it may
+  turn red but is deliberately outside the `CI required` aggregate, which is
+  unchanged. Current required jobs remain `required-requalifying`; target
+  jobs are candidates that must earn promotion through the qualification
+  window.
+
 - **Hosted CI aggregate check-run (`CI required`).** The main CI workflow
   now emits a single stable check-run that explicitly inspects every
   required job (build, parity, go-test, fuzz-short, skill-drift, postgres,
@@ -45,7 +90,7 @@
   merging — a policy gate today, mechanical once branch protection requires
   the check on `main`.
 
-## [0.2.8] — 2026-08-05
+## 0.2.8 — 2026-08-05
 
 ### Fixed
 
@@ -59,7 +104,7 @@
 
 ### Added
 
-## [0.2.7] — 2026-08-05
+## 0.2.7 — 2026-08-05
 
 ### Added
 
