@@ -29,8 +29,40 @@ sources:
   - path: raw # or vault folders like Clippings/, Papers/
     type: auto # auto-detect from file extension
     watch: true
+    # path: /existing/documents
+    # read_only: true # external source root; compile reads in place and ingest refuses writes
 
 output: wiki # compiled output directory (_wiki for vault overlay)
+
+### External read-only source roots
+
+`sources[].path` may be an absolute path to an existing documents directory.
+Sage reads that directory in place; the files do not need to be copied into
+the project's `raw/` directory. Set `read_only: true` when Sage must not use
+that source as an ingestion destination. Ingestion writes stay within the
+project directory; an external absolute source is never used as a write target,
+even when `read_only` is omitted:
+
+```yaml
+sources:
+  - path: /existing/documents
+    type: auto
+    watch: false
+    read_only: true
+```
+
+`read_only` is an application-level Sage guard for ingestion/write paths. It
+does not change Windows or other operating-system filesystem permissions;
+use the operating system's access controls when filesystem enforcement is
+required. Relative source paths such as `raw/` remain supported and retain
+their existing project-relative behavior.
+
+Where `filepath.Rel(projectDir, absoluteSourcePath)` succeeds, Sage uses its
+relative result as the manifest identity. On Windows, if the project and
+external root are on different volumes, `filepath.Rel` cannot produce a
+relative path and Sage keeps the slash-normalized absolute path as the identity.
+Moving the project directory can change relative identities and re-key affected
+external sources; Sage may then fully recompile those sources.
 
 # Output language for generated articles (default: English). When set, the
 # article body, H1 title, and section headings are all written in this
@@ -105,8 +137,13 @@ compiler:
                               # when two merge, the LONGER name stays canonical.
   # token_price_per_million: 0  # override pricing (0 = use built-in)
   # timezone: Asia/Shanghai   # IANA timezone for user-facing timestamps (default: UTC)
-  # quality:                  # zero-LLM article quality scorer (advisory, no gate)
+  # quality:                  # article quality scorer; retry makes it blocking (#144)
   #   threshold: 0.5          # warn when an article's composite score is below this
+  #   retry: false            # sub-threshold article gets ONE fresh rewrite; still-low
+                              # after retry counts as a compile error. Default false =
+                              # advisory-only (warn and ship). The on-disk file is removed
+                              # before the retry so it is a genuine fresh write. Flipping
+                              # the knob re-keys compiles (retry changes output).
   #   weight_format: 0.15     # 5 dimensions: format / grounding / coverage / wikilink / antipattern
   #   weight_grounding: 0.30
   #   weight_coverage: 0.20
@@ -130,6 +167,14 @@ compiler:
   # auto_demote: true          # demote stale articles
   # split_threshold: 15000     # chars — split large docs for faster writing
   # dedup_threshold: 0.85      # cosine similarity for concept dedup
+  # dedup_strategy: embedding  # embedding (default) | llm — the llm strategy runs a
+                              # global keep/fold/drop curation pass over the whole
+                              # concept set before article writing (#167) and
+                              # REPLACES embedding dedup; unknown values fail at load
+  # llm_dedup:                 # knobs for dedup_strategy: llm
+  #   allow_drop: false        # drops stay logged proposals until true (folds
+                              # auto-apply — they are additive)
+  #   batch_size: 200          # concepts per curation call (0 = load error)
   # backpressure: true         # adaptive concurrency on rate limits
 
 search:

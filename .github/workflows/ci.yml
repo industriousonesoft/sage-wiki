@@ -16,6 +16,12 @@ on:
   pull_request:
 
 # Least privilege — CI only reads the repo (mirrors release.yml/docker.yml).
+concurrency:
+  # Event-scoped: rapid pushes cancel only their own superseded runs;
+  # scheduled runs (separate event_name) never cancel in-flight push/PR runs.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -126,7 +132,12 @@ jobs:
           case "${{ matrix.shard }}" in
             compiler) PKGS="./internal/compiler" ;;
             core)     PKGS="./internal/api ./internal/mcp ./internal/llm ./internal/extract/..." ;;
-            rest)     PKGS=$(go list ./... | grep -v -E "internal/(compiler|api|mcp|llm|extract)" | tr '\n' ' ') ;;
+            # internal/parity is EXCLUDED: it has its own dedicated required
+            # job (full replay suite + 10x flake loop) AND the shadow's
+            # linux-race-parity shard. Measured: parity-with-race was 445s of
+            # this shard's 569s (78% of the critical-path pole) — pure
+            # triple-testing, zero coverage lost by removing it here.
+            rest)     PKGS=$(go list ./... | grep -v -E "internal/(compiler|api|mcp|llm|extract|parity)" | tr '\n' ' ') ;;
           esac
           echo "packages=$PKGS" >> "$GITHUB_OUTPUT"
 
@@ -148,9 +159,21 @@ jobs:
   # package (the five pure-string frontmatter sites live in five packages;
   # Go visibility forbids one cross-package target).
   fuzz-short:
-    name: Fuzz (short, SPEC-08)
+    name: Fuzz short (${{ matrix.target.name }})
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - {name: frontmatter-extract, pkg: ./internal/extract/, fn: FuzzFrontmatter}
+          - {name: frontmatter-web, pkg: ./internal/web/, fn: FuzzFrontmatter}
+          - {name: frontmatter-ontology, pkg: ./internal/ontology/, fn: FuzzFrontmatter}
+          - {name: frontmatter-wiki, pkg: ./internal/wiki/, fn: FuzzFrontmatter}
+          - {name: frontmatter-compiler, pkg: ./internal/compiler/, fn: FuzzFrontmatter}
+          - {name: wikilink, pkg: ./internal/compiler/, fn: FuzzWikilink}
+          - {name: alias-normalize, pkg: ./internal/compiler/, fn: FuzzAliasNormalize}
+          - {name: canonical, pkg: ./internal/compiler/, fn: FuzzCanonical}
     steps:
       - uses: actions/checkout@v4
 
@@ -159,67 +182,27 @@ jobs:
           go-version: "1.26"
           cache: true
 
-      - id: fm-extract
-        name: FuzzFrontmatter (extract)
-        run: go test -run=NONE -fuzz=FuzzFrontmatter -fuzztime=30s ./internal/extract/
-        continue-on-error: true
-      - id: fm-web
-        name: FuzzFrontmatter (web)
-        run: go test -run=NONE -fuzz=FuzzFrontmatter -fuzztime=30s ./internal/web/
-        continue-on-error: true
-      - id: fm-ontology
-        name: FuzzFrontmatter (ontology)
-        run: go test -run=NONE -fuzz=FuzzFrontmatter -fuzztime=30s ./internal/ontology/
-        continue-on-error: true
-      - id: fm-wiki
-        name: FuzzFrontmatter (wiki)
-        run: go test -run=NONE -fuzz=FuzzFrontmatter -fuzztime=30s ./internal/wiki/
-        continue-on-error: true
-      - id: fm-compiler
-        name: FuzzFrontmatter (compiler)
-        run: go test -run=NONE -fuzz=FuzzFrontmatter -fuzztime=30s ./internal/compiler/
-        continue-on-error: true
-      - id: wikilink
-        name: FuzzWikilink
-        run: go test -run=NONE -fuzz=FuzzWikilink -fuzztime=30s ./internal/compiler/
-        continue-on-error: true
-      - id: alias
-        name: FuzzAliasNormalize
-        run: go test -run=NONE -fuzz=FuzzAliasNormalize -fuzztime=30s ./internal/compiler/
-        continue-on-error: true
-      - id: canonical
-        name: FuzzCanonical
-        run: go test -run=NONE -fuzz=FuzzCanonical -fuzztime=30s ./internal/compiler/
-        continue-on-error: true
+      # SPEC-08 AC5 short PR-gated pass. Previously 8 sequential 30s
+      # invocations in ONE job (325s wall); matrix independence is the
+      # only change — same invocation shape, same hard-fail gate: a
+      # crasher fails this check directly (the old per-step
+      # continue-on-error existed so later targets could still run; in a
+      # matrix they run unconditionally).
+      - name: Fuzz
+        # -timeout 2m: explicit shutdown headroom beyond -fuzztime — when
+        # the fuzz deadline and the binary deadline coincide on a loaded
+        # runner, the coordinator dies with "context deadline exceeded"
+        # instead of stopping cleanly (2 sightings, rerun-clean).
+        run: go test -run=NONE -timeout 2m -fuzz=${{ matrix.target.fn }} -fuzztime=30s ${{ matrix.target.pkg }}
 
-      - name: Upload crashers (when any target failed)
-        if: always() && (steps.fm-extract.outcome == 'failure' || steps.fm-web.outcome == 'failure' || steps.fm-ontology.outcome == 'failure' || steps.fm-wiki.outcome == 'failure' || steps.fm-compiler.outcome == 'failure' || steps.wikilink.outcome == 'failure' || steps.alias.outcome == 'failure' || steps.canonical.outcome == 'failure')
+      - name: Upload crashers
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-short-crashers
-          path: |
-            internal/extract/testdata/fuzz/
-            internal/web/testdata/fuzz/
-            internal/ontology/testdata/fuzz/
-            internal/wiki/testdata/fuzz/
-            internal/compiler/testdata/fuzz/
+          name: fuzz-short-crashers-${{ matrix.target.name }}
+          path: ${{ matrix.target.pkg }}testdata/fuzz/
           if-no-files-found: ignore
           retention-days: 14
-
-      - name: Fail if any target crashed
-        if: always()
-        run: |
-          if [ "${{ steps.fm-extract.outcome }}" = "failure" ] || \
-             [ "${{ steps.fm-web.outcome }}" = "failure" ] || \
-             [ "${{ steps.fm-ontology.outcome }}" = "failure" ] || \
-             [ "${{ steps.fm-wiki.outcome }}" = "failure" ] || \
-             [ "${{ steps.fm-compiler.outcome }}" = "failure" ] || \
-             [ "${{ steps.wikilink.outcome }}" = "failure" ] || \
-             [ "${{ steps.alias.outcome }}" = "failure" ] || \
-             [ "${{ steps.canonical.outcome }}" = "failure" ]; then
-            echo "fuzz findings — see the fuzz-short-crashers artifact"
-            exit 1
-          fi
 
   skill-drift:
     name: Agent skill drift
@@ -248,7 +231,10 @@ jobs:
     # pgvector/pgvector ships the extension the v1 migration needs.
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        # Digest-pinned (ci/service-contracts.yaml carries the same pin —
+        # the required path must be at least as supply-chain-hard as the
+        # advisory shadow job, not softer).
+        image: pgvector/pgvector:pg16@sha256:a36250871de0833b8757561c72f2477ef1ddd1101afa4e617fb552e0de514c6b
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -314,13 +300,21 @@ jobs:
       # `server /data` — GitHub Actions service containers run the image's
       # default CMD with no override, and mineio/minio:latest no longer
       # defaults to running the server.
+      # MinIO has exited every public registry (Docker Hub repo removed,
+      # quay.io anonymous pulls closed 2026-09-25, dl.min.io 410). The Go
+      # module proxy still serves tagged release source, checksum-verified
+      # by sum.golang.org — build the pinned release instead of pulling an
+      # image. RELEASE.2025-09-07T16-13-09Z is the same release the former
+      # quay digest pin carried.
+      - name: Build MinIO from the module proxy
+        run: go install github.com/minio/minio@RELEASE.2025-09-07T16-13-09Z
+
       - name: Start MinIO
-        run: >
-          docker run -d --name minio
-          -p 9000:9000
-          -e MINIO_ROOT_USER=minioadmin
-          -e MINIO_ROOT_PASSWORD=minioadmin
-          minio/minio server /data --console-address ":9001"
+        run: |
+          mkdir -p /tmp/minio-data
+          MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
+            nohup "$(go env GOPATH)/bin/minio" server /tmp/minio-data \
+            --console-address ":9001" > /tmp/minio.log 2>&1 &
       - name: Wait for MinIO
         run: |
           for i in $(seq 1 20); do
@@ -334,7 +328,10 @@ jobs:
 
       - name: Create test buckets
         run: |
-          curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /tmp/mc
+          curl -fsSL https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z -o /tmp/mc
+          # Checksum-verified (same sha the shadow job and
+          # ci/service-contracts.yaml pin — required path, required pin).
+          echo "01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891  /tmp/mc" | sha256sum -c -
           chmod +x /tmp/mc
           /tmp/mc alias set local http://localhost:9000 minioadmin minioadmin
           /tmp/mc mb --ignore-existing local/sage-it-roundtrip
@@ -384,6 +381,13 @@ jobs:
       # A local `golangci-lint run` still reports everything for gradual cleanup.
       - name: Lint (new issues)
         run: golangci-lint run --new-from-merge-base=origin/main --timeout=5m ./...
+
+      # Workflow guards (failure classes this repo has shipped): a '#'
+      # comment inside a folded if-block corrupts the expression and the
+      # job silently skips forever (#206 — docker publishing halted for
+      # two merges). Self-tested: the guard must catch the bad shape.
+      - name: Workflow guards (self-tested)
+        run: bash scripts/ci/check-workflows.sh check
 
       # SPEC-04 D1 tripwire: unsorted map-range loops feeding serializers.
       # Best-effort grep + allowlist (limits documented in docs/determinism.md).

@@ -2,6 +2,133 @@
 
 ## [Unreleased]
 
+## 0.2.11 — 2026-10-03
+
+### Added
+
+- **External read-only source roots (#181).** `sources[].path` now accepts absolute
+  paths to existing document directories — Sage compiles them in place, never
+  copying into `raw/`. Setting `read_only: true` additionally blocks ingestion
+  writes to that source; relative source paths remain compatible.
+
+- **Blocking quality-gate retry — `compiler.quality.retry` (#144).** The
+  article quality gate was advisory-only: a sub-threshold article was logged
+  as "low quality" and shipped anyway. With `quality.retry: true` (default
+  `false`), a sub-threshold article gets exactly one rewrite — the on-disk
+  file is removed first, so the retry is a genuine fresh write rather than
+  an "improve this bad content" call (#145's `prepareArticle` gotcha) — and
+  still-low-after-retry counts as a real compile error. The knob is in the
+  compile key. First increment of the #144 roadmap; citation verification
+  is the follow-up design.
+
+### Fixed
+
+- **`max_compile_batch` bounds per-run work, not corpus size (#186).** The
+  batch guard compared against the raw manifest diff before skip
+  classification — and tier<3 sources never enter the manifest, so their
+  diff is ≈ the whole corpus on every compile. Any workspace larger than
+  the limit aborted every compile with a `compile_batch` LimitError,
+  including fully-compiled ones that could never reach the
+  nothing-to-compile fast path; MaxDocs-truncated drain runs died the same
+  way. The guard now runs after classification and compares against the
+  work the run will actually process (capped by MaxDocs when set).
+  Fail-fast semantics on genuinely over-limit runs are preserved.
+
+- **Events bus: Subscribe racing Close no longer trips the race detector
+  (#177).** `addSlot` released the bus mutex before `WaitGroup.Add(1)` — a
+  descheduled Subscribe straggler could fire its Add after Close's Wait had
+  already returned at zero, the documented `sync.WaitGroup` data race
+  (three macOS race-detector sightings, all rerun-clean). The Add now sits
+  inside the mutex critical section, closing the window by construction.
+
+### Internal
+
+- **CI fleet hardening and speed** (11 commits, #176–#208): MinIO moved
+  from dead public registries to the Go module proxy (checksum-verified
+  via sum.golang.org) with the responsibility gate extended to
+  module-pinned services; fork-run/approval and publish-path races fixed;
+  concurrency groups cancel superseded runs; the never-green CI Observe
+  (broken jq splice, unwired verdict, unattainable p95 bound) and CI
+  Diagnostics parity-repetition timeout repaired; the qualification
+  verdict now commits to `ci/qualification.json`; required jobs
+  digest/checksum-pinned; parity deduplicated out of the rest shard (it
+  was triple-tested — 78% of the critical-path pole) and fuzz-short
+  matrix-ized; a self-tested workflow guard in Lint kills the
+  comment-in-folded-if class before merge. Measured wall on the required
+  path: 10.7 min before the final speed pass, ~9 min after (the earlier
+  21-minute figure predates the whole series, concurrency onward).
+
+## 0.2.10 — 2026-08-22
+
+### Added
+
+- **Global LLM concept curation — `dedup_strategy: "llm"` (#167).** The
+  documented-but-missing `llm` strategy now exists: a single curation pass
+  over the *full* newly-extracted concept set (plus existing manifest names
+  as fold targets) runs before article writing, on all three compile paths —
+  the only stage with global view, so a corpus-wide selectivity bar can
+  finally be enforced. Per concept it decides keep / fold / drop: folds
+  auto-apply (additive — sources union into the target and the name is
+  recorded as an alias), drops are gated behind `llm_dedup.allow_drop`
+  (default `false`) and stay logged proposals otherwise. Deterministic
+  never-merge guards (#164) veto any proposed fold between enumerated
+  identities, unknown actions keep the concept, and a total curation failure
+  is counted and the compile proceeds uncurated. The judgment prompt is
+  workspace-overridable (`prompts/curate-concepts.md`); new knobs
+  `compiler.llm_dedup.allow_drop` and `compiler.llm_dedup.batch_size`
+  (default 200) enter the compile key. Enabling `llm` replaces embedding
+  dedup — running both is incoherent.
+
+### Fixed
+
+- **Configured source types survive binary extraction (#168).** A custom
+  `sources[].type` (e.g. `governance`) was silently discarded for every
+  binary format — PDF, docx, xlsx, pptx, csv, epub, eml/msg — so the
+  summarize pass always rendered the built-in paper/article/dataset prompt
+  and wrote the wrong `source_type` frontmatter, while markdown/text/external
+  sources honored the type. Detection was already correct (manifest,
+  `--dry-run`); extraction now propagates the configured type to the prompt
+  registry and frontmatter for all formats. `image` and `code` stay pinned —
+  they route to the vision/code pipelines rather than restyle the prompt.
+
+- **Injective citation relation IDs (#165).** `sanitizeID` collapsed `/`,
+  `\`, `.`, and space all to `-`, so two sources whose paths differed only in
+  punctuation produced the same `cites` relation ID; the second insert hit
+  the `relations.id` primary key and the provenance edge was dropped at WARN
+  with the compile exiting 0 — invisible to `wiki_provenance` and graph
+  traversal. Relation IDs now append an 8-hex hash of the raw path:
+  injective, deterministic, readable. Existing vaults are unaffected —
+  recompiles update the same natural edge in place.
+
+- **Partial concept-extraction failures are counted and named (#166).** When
+  some — but not all — extraction batches failed, the compile reported
+  `errors=0` and exited 0 while silently skipping up to half the corpus. A
+  typed `PartialFailureError` now increments the error count on all three
+  call paths and WARN-logs the skipped source documents by name, while the
+  surviving concepts still proceed (partial recovery preserved). When a
+  structured-output parse failure coincides with `finish_reason=length`, the
+  error names the token cap (`MaxTokens=N`) instead of a bare
+  `unexpected end of JSON input`.
+
+- **Deterministic never-merge guards for concept dedup (#164).** In
+  enumerated corpora, names differing by a digit or a draft/final qualifier
+  embed almost identically to true duplicates — measured, must-merge and
+  must-not-merge pairs interleave across the whole similarity range and peak
+  at the same 0.982 — so no cosine threshold separates them, and auto-merge
+  silently deleted distinct entities (merged concepts cease to exist as
+  articles/entities). Two deterministic guards now sit inside the dedup
+  check, regardless of score: digit-containing token sets must be equal
+  (`mw-3`/`mw-2`, `a-17-084`/`a-17-086`, `task-order-no-44`/`no-4`), and
+  `draft`/`final` + `primary`/`secondary` qualifier asymmetry blocks the
+  merge. Dedup merge logging raised INFO → WARN so merges are discoverable.
+  Same-number containment and synonym-media pairs remain threshold-governed
+  (use `dedup_strategy: "llm"` for those).
+
+- **Internal: CI waiver test fixture date-rot (#170).** A ciproof test
+  fixture's waiver expiry (2026-08-20) turned required CI checks red on
+  every run regardless of the code under test; the valid-case fixture now
+  carries a far-future date.
+
 ## 0.2.9 — 2026-08-14
 
 ### Fixed

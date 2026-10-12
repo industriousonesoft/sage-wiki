@@ -291,11 +291,19 @@ func runFullPipeline(sources []SourceInfo, opts FullPipelineOpts) *FullPipelineR
 	progress.StartPhase("Pass 2: Extract concepts", len(successfulSummaries))
 	concepts, err := ExtractConcepts(opts.Ctx, successfulSummaries, mf.Concepts, client, extractModel, cfg.Compiler.ExtractBatchSize, cfg.Compiler.ExtractMaxTokens, cfg.Compiler.MaxParallel, opts.Prompts, cfg.Compiler.CompileTemperature())
 	if err != nil {
-		progress.ItemError("concept extraction", err)
-		result.Errors++
-		progress.EndPhase()
-		client.TeardownCache(extCacheID)
-		return result
+		var pfe *PartialFailureError
+		if errors.As(err, &pfe) {
+			// Partial failure (issue #166): count it and name the skipped
+			// documents, but keep going with the surviving concepts.
+			result.Errors++
+			progress.ItemError("concept extraction (partial)", err)
+		} else {
+			progress.ItemError("concept extraction", err)
+			result.Errors++
+			progress.EndPhase()
+			client.TeardownCache(extCacheID)
+			return result
+		}
 	}
 
 	// Budget guard: stop between passes when MaxCost is exceeded.
@@ -320,7 +328,10 @@ func runFullPipeline(sources []SourceInfo, opts FullPipelineOpts) *FullPipelineR
 		for _, c := range concepts {
 			match, score, vec := dc.CheckDuplicate(c.Name)
 			if match != "" {
-				log.Info("concept dedup: merging", "new", c.Name, "existing", match, "score", score)
+				// WARN, not INFO (issue #164): an auto-merge deletes a concept
+				// as its own entity — that must be discoverable, not one INFO
+				// line inside thousands.
+				log.Warn("concept dedup: merging", "new", c.Name, "existing", match, "score", score)
 				// Merge sources into existing concept (deduplicate source list)
 				mergeConceptIntoManifest(mf, match, c)
 				merged++
@@ -336,7 +347,7 @@ func runFullPipeline(sources []SourceInfo, opts FullPipelineOpts) *FullPipelineR
 		}
 
 		if merged > 0 {
-			log.Info("concept dedup complete", "original", len(concepts), "merged", merged, "remaining", len(dedupedConcepts))
+			log.Warn("concept dedup complete", "original", len(concepts), "merged", merged, "remaining", len(dedupedConcepts))
 		}
 		concepts = dedupedConcepts
 	}
@@ -344,6 +355,16 @@ func runFullPipeline(sources []SourceInfo, opts FullPipelineOpts) *FullPipelineR
 	// Evidence gate (#128): source-less concepts are suppressed entirely —
 	// no manifest entry, no article, no entity, no cites.
 	concepts, _ = filterLowEvidence(concepts, cfg.Compiler.MinConceptSourcesOrDefault())
+
+	// LLM curation pass (#167): when dedup_strategy is "llm", this REPLACES
+	// the embedding dedup above. Runs at the same seam on all three write
+	// paths. Failure is advisory: count it and proceed uncurated.
+	if curated, cerr := maybeCurateConcepts(orBackground(opts.Ctx), client, extractModel, opts.Prompts, concepts, mf, cfg); cerr != nil {
+		result.Errors++
+		log.Warn("concept curation failed — proceeding uncurated", "error", cerr)
+	} else {
+		concepts = curated
+	}
 	result.ConceptsExtracted = len(concepts)
 
 	var conceptNames []string
@@ -435,7 +456,7 @@ func runFullPipeline(sources []SourceInfo, opts FullPipelineOpts) *FullPipelineR
 	}
 	relPatterns := ontology.RelationPatterns(merged)
 	progress.StartPhase("Pass 3: Write articles", len(concepts))
-	articles := WriteArticles(ArticleWriteOpts{
+	writeOpts := ArticleWriteOpts{
 		Temperature:            cfg.Compiler.CompileTemperature(),
 		Prompts:                opts.Prompts,
 		Ctx:                    opts.Ctx,
@@ -462,7 +483,8 @@ func runFullPipeline(sources []SourceInfo, opts FullPipelineOpts) *FullPipelineR
 		Backpressure:           opts.Backpressure,
 		AntiPatternPhrases:     cfg.Compiler.AntiPatternPhrasesOrDefault(),
 		AllConcepts:            manifestConceptRefs(mf.Concepts),
-	}, concepts)
+	}
+	articles := WriteArticles(writeOpts, concepts)
 
 	// Pass 3's contribution to the resolution set. concept.Name IS the entity id
 	// WriteArticles wrote (write.go). ar.Error == nil does not strictly prove the
@@ -513,7 +535,7 @@ func runFullPipeline(sources []SourceInfo, opts FullPipelineOpts) *FullPipelineR
 				var sourceText string
 				if concept, ok := mf.Concepts[ar.ConceptName]; ok {
 					for _, srcPath := range concept.Sources {
-						data, err := os.ReadFile(filepath.Join(opts.ProjectDir, srcPath))
+						data, err := os.ReadFile(resolveSourcePath(opts.ProjectDir, srcPath))
 						if err == nil {
 							sourceText += string(data) + "\n"
 						}
@@ -521,6 +543,48 @@ func runFullPipeline(sources []SourceInfo, opts FullPipelineOpts) *FullPipelineR
 				}
 
 				scores := ScoreArticle(string(articleContent), sourceText, ar.ConceptName, mf, qualityWeights)
+
+				// Blocking quality retry (issue #144): one fresh rewrite for a
+				// sub-threshold article. The on-disk file is removed FIRST so the
+				// retry is a genuine fresh write, never seeded from the bad
+				// content (#145 prepareArticle gotcha). Still-low after the retry
+				// counts as a compile error — the article ships with its final
+				// score recorded either way.
+				if scores.Combined < qualityThreshold && cfg.Compiler.Quality.RetryOrDefault() {
+					if concept, ok := mf.Concepts[ar.ConceptName]; ok {
+						if rmErr := os.Remove(filepath.Join(opts.ProjectDir, ar.ArticlePath)); rmErr != nil && !os.IsNotExist(rmErr) {
+							log.Warn("quality retry: remove article failed — keeping original",
+								"concept", ar.ConceptName, "path", ar.ArticlePath, "error", rmErr)
+						} else {
+							retryRes := RetryArticle(writeOpts, ExtractedConcept{
+								Name:    ar.ConceptName,
+								Aliases: concept.Aliases,
+								Sources: concept.Sources,
+							})
+							if retryRes.Error == nil && retryRes.ConceptName != "" {
+								ar.ArticlePath = retryRes.ArticlePath
+								articleContent, _ = os.ReadFile(filepath.Join(opts.ProjectDir, retryRes.ArticlePath))
+								scores = ScoreArticle(string(articleContent), sourceText, ar.ConceptName, mf, qualityWeights)
+								log.Warn("quality retry complete", "concept", ar.ConceptName,
+									"score", scores.Combined)
+								if scores.Combined < qualityThreshold {
+									result.Errors++
+									log.Warn("low quality article after retry — counted as compile error",
+										"concept", ar.ConceptName, "score", scores.Combined)
+								}
+								// fall through to record the final score below
+							} else {
+								log.Warn("quality retry write failed — keeping original score",
+									"concept", ar.ConceptName, "error", retryRes.Error)
+								// the original file is gone; the failed retry is an error
+								result.Errors++
+								belowThreshold++
+								continue
+							}
+						}
+					}
+				}
+
 				for _, srcPath := range mf.Concepts[ar.ConceptName].Sources {
 					if err := opts.ItemStore.SetQualityScore(srcPath, scores.Combined); err != nil {
 						log.Warn("set quality score failed", "path", srcPath, "error", err)
@@ -529,10 +593,12 @@ func runFullPipeline(sources []SourceInfo, opts FullPipelineOpts) *FullPipelineR
 
 				if scores.Combined < qualityThreshold {
 					belowThreshold++
-					log.Warn("low quality article", "concept", ar.ConceptName,
-						"score", scores.Combined, "format", scores.Format,
-						"grounding", scores.Grounding, "coverage", scores.Coverage,
-						"wikilink", scores.Wikilink, "antipattern", scores.AntiPattern)
+					if !cfg.Compiler.Quality.RetryOrDefault() {
+						log.Warn("low quality article", "concept", ar.ConceptName,
+							"score", scores.Combined, "format", scores.Format,
+							"grounding", scores.Grounding, "coverage", scores.Coverage,
+							"wikilink", scores.Wikilink, "antipattern", scores.AntiPattern)
+					}
 				}
 			}
 		}

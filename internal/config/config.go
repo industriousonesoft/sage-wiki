@@ -226,9 +226,10 @@ type VaultConfig struct {
 }
 
 type Source struct {
-	Path  string `yaml:"path"`
-	Type  string `yaml:"type"`
-	Watch bool   `yaml:"watch"`
+	Path     string `yaml:"path"`
+	Type     string `yaml:"type"`
+	Watch    bool   `yaml:"watch"`
+	ReadOnly bool   `yaml:"read_only,omitempty"`
 }
 
 type APIConfig struct {
@@ -304,8 +305,9 @@ type CompilerConfig struct {
 	BackpressureEnabled *bool `yaml:"backpressure,omitempty"` // enable adaptive backpressure (default: true)
 
 	// Concept deduplication
-	DedupThreshold float64 `yaml:"dedup_threshold,omitempty"` // cosine similarity for auto-merge (default: 0.85)
-	DedupStrategy  string  `yaml:"dedup_strategy,omitempty"`  // "embedding" (default) or "llm"
+	DedupThreshold float64        `yaml:"dedup_threshold,omitempty"` // cosine similarity for auto-merge (default: 0.85)
+	DedupStrategy  string         `yaml:"dedup_strategy,omitempty"`  // "embedding" (default) or "llm" (issue #167: global curation pass)
+	LLMDedup       LLMDedupConfig `yaml:"llm_dedup,omitempty"`       // knobs for dedup_strategy: "llm"
 
 	// Wikilink validation
 	StripBrokenLinks *bool `yaml:"strip_broken_links,omitempty"` // strip [[wikilinks]] to non-existent concept articles after compile (default: true). Set false to preserve broken links (useful when expecting future compiles to fill them in). Issue #90.
@@ -367,6 +369,29 @@ func (c CompilerConfig) SummaryNamingOrDefault() string {
 // (issue #97). All fields default when zero — see CompilerConfig.QualityThreshold
 // and CompilerConfig.QualityWeights. The composite score is stored in
 // compile_items.quality_score and surfaced (not gated) by `sage-wiki lint`.
+// LLMDedupConfig holds knobs for dedup_strategy: "llm" (issue #167). The
+// curation pass replaces embedding dedup when enabled — running both is
+// incoherent (embedding merges would pre-empt judgment).
+type LLMDedupConfig struct {
+	// AllowDrop: curation may DROP concepts outright. Drops are destructive;
+	// folds (sources union + alias recorded) are additive — so folds
+	// auto-apply while drops stay logged proposals until this is true.
+	AllowDrop bool `yaml:"allow_drop,omitempty"`
+	// BatchSize: concepts per curation call. Bounded output per call (the
+	// #166 truncation lesson). *int so nil = default 200 while an explicit
+	// 0 is a load error (same nil-vs-zero distinction as min_concept_sources).
+	BatchSize *int `yaml:"batch_size,omitempty"`
+}
+
+func (l LLMDedupConfig) AllowDropOrDefault() bool { return l.AllowDrop }
+
+func (l LLMDedupConfig) BatchSizeOrDefault() int {
+	if l.BatchSize == nil || *l.BatchSize <= 0 {
+		return 200
+	}
+	return *l.BatchSize
+}
+
 type QualityConfig struct {
 	Threshold         float64 `yaml:"threshold,omitempty"`          // warn below this composite score (default: 0.5)
 	WeightFormat      float64 `yaml:"weight_format,omitempty"`      // default: 0.15
@@ -374,7 +399,14 @@ type QualityConfig struct {
 	WeightCoverage    float64 `yaml:"weight_coverage,omitempty"`    // default: 0.20
 	WeightWikilink    float64 `yaml:"weight_wikilink,omitempty"`    // default: 0.15
 	WeightAntiPattern float64 `yaml:"weight_antipattern,omitempty"` // default: 0.20
+	// Retry (issue #144): give a sub-threshold article ONE rewrite attempt.
+	// The on-disk file is removed before the retry so the rewrite is a fresh
+	// write (not seeded from the bad content); still-low-after-retry counts
+	// as a compile error. Default false — advisory-only behavior unchanged.
+	Retry *bool `yaml:"retry,omitempty"`
 }
+
+func (q QualityConfig) RetryOrDefault() bool { return q.Retry != nil && *q.Retry }
 
 // Default quality weights (issue #97 proposal). Kept here so the config
 // accessors can supply per-field fallbacks without importing the compiler.
@@ -1285,6 +1317,19 @@ func (c *Config) validateStorage() error {
 func (c *Config) Validate() error {
 	if c.Project == "" {
 		return fmt.Errorf("config: 'project' is required")
+	}
+	// Issue #167: dedup_strategy was documented ("embedding" or "llm") but
+	// never validated — setting "llm" silently DISABLED dedup entirely (the
+	// pipeline gate excluded it from embedding dedup with no other
+	// implementation). Reject unknown values at load; "llm" selects the
+	// curation pass.
+	switch s := c.Compiler.DedupStrategy; s {
+	case "", "embedding", "llm":
+	default:
+		return fmt.Errorf("config: compiler.dedup_strategy: unknown value %q (valid: embedding, llm)", s)
+	}
+	if c.Compiler.LLMDedup.BatchSize != nil && *c.Compiler.LLMDedup.BatchSize <= 0 {
+		return fmt.Errorf("config: compiler.llm_dedup.batch_size must be > 0 (got %d)", *c.Compiler.LLMDedup.BatchSize)
 	}
 	// SPEC-07 webhooks: fail at load, not at 3am delivery time.
 	for i, wh := range c.Serve.Webhooks {

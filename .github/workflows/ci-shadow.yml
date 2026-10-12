@@ -23,6 +23,12 @@ on:
     - cron: "17 3 * * *"
   workflow_dispatch:
 
+concurrency:
+  # Event-scoped: rapid pushes cancel only their own superseded runs;
+  # scheduled runs (separate event_name) never cancel in-flight push/PR runs.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -238,14 +244,21 @@ jobs:
 
       # Background docker container (not a service container) so the server
       # command is explicit — the image's default CMD no longer starts it.
+      # MinIO has exited every public registry (Docker Hub repo removed,
+      # quay.io anonymous pulls closed 2026-09-25, dl.min.io 410). The Go
+      # module proxy still serves tagged release source, checksum-verified
+      # by sum.golang.org — build the pinned release instead of pulling an
+      # image. RELEASE.2025-09-07T16-13-09Z is the same release the former
+      # quay digest pin above carried (sha256:14cea49...).
+      - name: Build MinIO from the module proxy
+        run: go install github.com/minio/minio@RELEASE.2025-09-07T16-13-09Z
+
       - name: Start MinIO
-        run: >
-          docker run -d --name minio
-          -p 9000:9000
-          -e MINIO_ROOT_USER=minioadmin
-          -e MINIO_ROOT_PASSWORD=minioadmin
-          minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
-          server /data --console-address ":9001"
+        run: |
+          mkdir -p /tmp/minio-data
+          MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
+            nohup "$(go env GOPATH)/bin/minio" server /tmp/minio-data \
+            --console-address ":9001" > /tmp/minio.log 2>&1 &
 
       - name: Wait for MinIO
         run: |
@@ -260,7 +273,7 @@ jobs:
 
       - name: Create test buckets (pinned mc)
         run: |
-          curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /tmp/mc
+          curl -fsSL https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z -o /tmp/mc
           echo "01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891  /tmp/mc" | sha256sum -c -
           chmod +x /tmp/mc
           /tmp/mc alias set local http://localhost:9000 minioadmin minioadmin

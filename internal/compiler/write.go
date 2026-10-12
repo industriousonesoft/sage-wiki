@@ -2,7 +2,9 @@ package compiler
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -370,7 +372,7 @@ func applyArticlePayload(opts ArticleWriteOpts, payload *articlePayload, result 
 			log.Warn("failed to create source entity", "source", src, "error", err)
 		}
 		if err := opts.OntStore.AddRelation(ontology.Relation{
-			ID:       concept.Name + "-cites-" + sanitizeID(src),
+			ID:       citesRelationID(concept.Name, src),
 			SourceID: concept.Name,
 			TargetID: src,
 			Relation: ontology.RelCites,
@@ -920,6 +922,19 @@ func sanitizeID(s string) string {
 	return strings.NewReplacer("/", "-", "\\", "-", ".", "-", " ", "-").Replace(s)
 }
 
+// citesRelationID builds the relation ID for a concept→source citation edge.
+// The readable slug alone is NOT injective: sanitizeID collapses `/`, `\`,
+// `.` and space to `-`, so two real sources whose paths differ only in
+// punctuation collide on the relations.id primary key and the second edge is
+// silently dropped (issue #165). The 8-hex-char hash of the RAW path makes
+// the ID injective while keeping the slug prefix readable; identical paths
+// stay deterministic, and genuine re-assertion is handled by AddRelation's
+// natural-key upsert ON CONFLICT(source_id, target_id, relation).
+func citesRelationID(concept, src string) string {
+	sum := sha256.Sum256([]byte(src))
+	return concept + "-cites-" + sanitizeID(src) + "-" + hex.EncodeToString(sum[:4])
+}
+
 func mapConfidence(value string) string {
 	v := strings.ToLower(strings.TrimSpace(value))
 	switch {
@@ -1075,7 +1090,7 @@ func buildSourceContext(projectDir string, concept ExtractedConcept, threshold i
 	var parts []sourcePart
 
 	for _, srcPath := range concept.Sources {
-		absPath := filepath.Join(projectDir, srcPath)
+		absPath := resolveSourcePath(projectDir, srcPath)
 		data, err := os.ReadFile(absPath)
 		if err != nil {
 			continue
@@ -1170,4 +1185,17 @@ func buildSourceContext(projectDir string, concept ExtractedConcept, threshold i
 	// document can't close the write_article template's untrusted frame
 	// early (SEC-04, site 5 — the template wraps this whole string).
 	return prompts.NeutralizeTags(strings.Join(kept, "\n\n---\n\n"))
+}
+
+// RetryArticle re-writes ONE article from scratch (issue #144 blocking
+// quality retry). The caller MUST remove the on-disk article file before
+// calling — prepareArticle seeds ExistingArticle from whatever is on disk,
+// so leaving the bad article there would turn the retry into an
+// "improve this bad content" call instead of a fresh write (#145 gotcha).
+// Rebuilds the single-concept alias/related context the same way
+// WriteArticles builds it for the batch.
+func RetryArticle(opts ArticleWriteOpts, concept ExtractedConcept) ArticleResult {
+	aliasMap := buildAliasMap([]ExtractedConcept{concept}, opts.AllConcepts)
+	relatedIndex := buildRelatedConceptsIndex(opts.AllConcepts, maxRelatedConcepts)
+	return writeOneArticle(opts, concept, aliasMap, relatedIndex[concept.Name])
 }
